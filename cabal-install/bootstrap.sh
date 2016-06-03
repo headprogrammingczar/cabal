@@ -16,7 +16,10 @@ EXTRA_CONFIGURE_OPTS=${EXTRA_CONFIGURE_OPTS-$DEFAULT_CONFIGURE_OPTS}
 #EXTRA_BUILD_OPTS
 #EXTRA_INSTALL_OPTS
 
-die () { printf "\nError during cabal-install bootstrap:\n$1\n" >&2 && exit 2 ;}
+die() {
+    printf "\nError during cabal-install bootstrap:\n%s\n" "$1" >&2
+    exit 2
+}
 
 # programs, you can override these by setting environment vars
 GHC="${GHC:-ghc}"
@@ -51,13 +54,12 @@ GZIP_PROGRAM="${GZIP_PROGRAM:-gzip}"
 SCOPE_OF_INSTALLATION="${SCOPE_OF_INSTALLATION:---user}"
 DEFAULT_PREFIX="${HOME}/.cabal"
 
-# Try to respect $TMPDIR.
-[ -"$TMPDIR"- = -""- ] &&
-  export TMPDIR=/tmp/cabal-$(echo $(od -XN4 -An /dev/random)) && mkdir $TMPDIR
+TMPDIR=$(mktemp -d -p /tmp -t cabal-XXXXXXX)
+export TMPDIR
 
 # Check for a C compiler, using user-set $CC, if any, first.
 for c in $CC gcc clang cc icc; do
-  $c --version 2>&1 >/dev/null && CC=$c &&
+  $c --version 1>/dev/null 2>&1 && CC=$c &&
   echo "Using $c for C compiler. If this is not what you want, set CC." >&2 &&
   break
 done
@@ -68,8 +70,12 @@ done
 
 # Find the correct linker/linker-wrapper.
 LINK="$(for link in collect2 ld; do
-          [ $($CC -print-prog-name=$link) = $link ] && continue ||
-          $CC -print-prog-name=$link
+          if [ $($CC -print-prog-name=$link) = $link ]
+          then
+              continue
+          else
+              $CC -print-prog-name=$link
+          fi
         done)"
 
 # Fall back to "ld"... might work.
@@ -99,13 +105,13 @@ ${GHC} --numeric-version > /dev/null 2>&1  ||
 
 ${GHC_PKG} --version     > /dev/null 2>&1  || die "${GHC_PKG} not found."
 
-GHC_VER="$(${GHC} --numeric-version)"
 GHC_PKG_VER="$(${GHC_PKG} --version | cut -d' ' -f 5)"
 
 [ ${GHC_VER} = ${GHC_PKG_VER} ] ||
   die "Version mismatch between ${GHC} and ${GHC_PKG}.
        If you set the GHC variable then set GHC_PKG too."
 
+JOBS="-j1"
 while [ "$#" -gt 0 ]; do
   case "${1}" in
     "--user")
@@ -128,14 +134,28 @@ while [ "$#" -gt 0 ]; do
     "--no-doc")
       NO_DOCUMENTATION=1
       shift;;
+    "-j"|"--jobs")
+        shift
+        # check if there is another argument which doesn't start with - or --
+        if [ "$#" -le 0 ] \
+            || [ ! -z $(echo "${1}" | grep "^-") ] \
+            || [ ! -z $(echo "${1}" | grep "^--") ]
+        then
+            JOBS="-j"
+        else
+            JOBS="-j${1}"
+            shift
+        fi;;
     *)
       echo "Unknown argument or option, quitting: ${1}"
       echo "usage: bootstrap.sh [OPTION]"
       echo
       echo "options:"
+      echo "   -j/--jobs       Number of concurrent workers to use (Default: 1)"
+      echo "                   -j without an argument will use all available cores"
       echo "   --user          Install for the local user (default)"
       echo "   --global        Install systemwide (must be run as root)"
-      echo "   --no-doc        Do not generate documentation for installed "\
+      echo "   --no-doc        Do not generate documentation for installed"\
            "packages"
       echo "   --sandbox       Install to a sandbox in the default location"\
            "(.cabal-sandbox)"
@@ -143,6 +163,15 @@ while [ "$#" -gt 0 ]; do
       exit;;
   esac
 done
+
+# Do not try to use -j with GHC older than 7.8
+case $GHC_VER in
+    7.4*|7.6*)
+        JOBS=""
+        ;;
+    *)
+        ;;
+esac
 
 abspath () { case "$1" in /*)printf "%s\n" "$1";; *)printf "%s\n" "$PWD/$1";;
              esac; }
@@ -226,7 +255,7 @@ OLD_LOCALE_VER="1.0.0.7"; OLD_LOCALE_VER_REGEXP="1\.0\.?"
                        # >=1.0.0.0 && <1.1
 BASE16_BYTESTRING_VER="0.1.1.6"; BASE16_BYTESTRING_VER_REGEXP="0\.1"
                        # 0.1.*
-BASE64_BYTESTRING_VER="1.0.0.1"; BASE64_BYTESTRING_REGEXP="1\."
+BASE64_BYTESTRING_VER="1.0.0.1"; BASE64_BYTESTRING_VER_REGEXP="1\."
                        # >=1.0
 CRYPTOHASH_SHA256_VER="0.11.7.1"; CRYPTOHASH_SHA256_VER_REGEXP="0\.11\.?"
                        # 0.11.*
@@ -331,7 +360,7 @@ install_pkg () {
   [ -x Setup ] && ./Setup clean
   [ -f Setup ] && rm Setup
 
-  ${GHC} --make Setup -o Setup ||
+  ${GHC} --make ${JOBS} Setup -o Setup ||
     die "Compiling the Setup script failed."
 
   [ -x Setup ] || die "The Setup script does not exist or cannot be run"
@@ -342,7 +371,7 @@ install_pkg () {
 
   ./Setup configure $args || die "Configuring the ${PKG} package failed."
 
-  ./Setup build ${EXTRA_BUILD_OPTS} ${VERBOSE} ||
+  ./Setup build ${JOBS} ${EXTRA_BUILD_OPTS} ${VERBOSE} ||
      die "Building the ${PKG} package failed."
 
   if [ ! ${NO_DOCUMENTATION} ]
@@ -376,10 +405,8 @@ do_pkg () {
         echo "Downloading ${PKG}-${VER}..."
         fetch_pkg ${PKG} ${VER}
     fi
-    unpack_pkg ${PKG} ${VER}
-    cd "${PKG}-${VER}"
-    install_pkg ${PKG} ${VER}
-    cd ..
+    unpack_pkg "${PKG}" "${VER}"
+    (cd "${PKG}-${VER}" && install_pkg ${PKG} ${VER})
   fi
 }
 
@@ -391,9 +418,7 @@ do_Cabal_pkg () {
         if need_pkg "Cabal" ${CABAL_VER_REGEXP}
         then
             echo "Cabal-${CABAL_VER} will be installed from the local Git clone."
-            cd ../Cabal
-            install_pkg ${CABAL_VER} ${CABAL_VER_REGEXP}
-            cd ../cabal-install
+            (cd ../Cabal && install_pkg ${CABAL_VER} ${CABAL_VER_REGEXP})
         else
             echo "Cabal-${CABAL_VER} is already installed and the version is ok."
         fi
